@@ -31,10 +31,10 @@ function rgb(r, g, b) {
   return r + g * 256 + b * 65536
 }
 
-const HIGHLIGHT_NONE_RGB = -1
+const HIGHLIGHT_NONE = 'none'
 
 const highlightColorMap = {
-  highlightNone: HIGHLIGHT_NONE_RGB,
+  highlightNone: HIGHLIGHT_NONE,
   colorYellow: rgb(255, 255, 0),
   colorGreen: rgb(0, 255, 0),
   colorCyan: rgb(0, 255, 255),
@@ -48,7 +48,6 @@ const fontColorMap = {
   fontGreen: rgb(0, 176, 80),
   fontWhite: rgb(255, 255, 255)
 }
-
 
 const highlightColorIds = ['highlightNone', 'colorYellow', 'colorGreen', 'colorCyan', 'colorPink']
 
@@ -104,64 +103,261 @@ function getFontRGB() {
     : fontColorMap.fontBlack
 }
 
-function getFontRGBFromRange(textRange) {
-  try {
-    return Number(textRange.Font.Fill.ForeColor.RGB)
-  } catch (e) {}
-
-  try {
-    return Number(textRange.Font.Color.RGB)
-  } catch (e) {}
-
-  return NaN
-}
-
 function setFontRGBToRange(textRange, color) {
   try {
     textRange.Font.Fill.ForeColor.RGB = color
     return
-  } catch (e) {}
+  } catch (e) {
+    // Fall back to the older Font.Color API below.
+  }
 
   textRange.Font.Color.RGB = color
 }
 
-let highlightInterval = null
-let fontcolorInterval = null
+function getFontRGBFromRange(textRange) {
+  try {
+    return Number(textRange.Font.Fill.ForeColor.RGB)
+  } catch (e) {
+    // Some WPS text ranges expose color through Font.Color instead of TextFrame2 fill.
+  }
 
-function applyTextStyleToSelection() {
-  const currentSelection = app.ActiveWindow.Selection
-  const currentTextRange = currentSelection.TextRange
-  if (!currentTextRange || currentTextRange.Length <= 0) {
+  try {
+    return Number(textRange.Font.Color.RGB)
+  } catch (e) {
+    return NaN
+  }
+}
+
+function getStyleRGBFromRange(styleType, textRange) {
+  if (styleType === 'highlight') {
+    const highlightRGB = Number(textRange.Font.Highlight.RGB)
+    return highlightRGB === -1 ? HIGHLIGHT_NONE : highlightRGB
+  }
+
+  return getFontRGBFromRange(textRange)
+}
+
+function clearHighlightFromRange(textRange) {
+  if (getStyleRGBFromRange('highlight', textRange) === HIGHLIGHT_NONE) {
+    return true
+  }
+
+  const commandBars = app.CommandBars
+  if (!commandBars || typeof commandBars.ExecuteMso !== 'function') {
     return false
   }
 
-  const shape = currentSelection.ShapeRange.Item(1)
-  const targetRange = shape.TextFrame2.TextRange.Characters(
-    currentTextRange.Start,
-    currentTextRange.Length
-  )
+  const clearHighlightCommands = ['TextHighlightColorPickerLicensed', 'TextHighlightColorPicker']
 
-  const highlightRGB = getHighlightRGB()
+  try {
+    textRange.Select()
+  } catch (e) {
+    console.log('select range before clear highlight failed;', e)
+    return false
+  }
 
-  let alreadyHighlighted = true
-  for (let i = 1; i <= currentTextRange.Length; i++) {
-    const charRange = targetRange.Characters(i, 1)
-    if (Number(charRange.Font.Highlight.RGB) !== highlightRGB) {
-      alreadyHighlighted = false
-      break
+  for (const commandId of clearHighlightCommands) {
+    try {
+      commandBars.ExecuteMso(commandId)
+      return true
+    } catch (e) {
+      console.log('clear highlight command failed;', commandId, e)
     }
   }
 
-  if (alreadyHighlighted) {
-    console.log('already highlighted, skipping;')
+  return false
+}
+
+function setStyleRGBToRange(styleType, textRange, color) {
+  if (styleType === 'highlight') {
+    if (color === HIGHLIGHT_NONE) {
+      clearHighlightFromRange(textRange)
+      return
+    }
+
+    textRange.Font.Highlight.RGB = color
+    return
+  }
+
+  setFontRGBToRange(textRange, color)
+}
+
+function getTargetRGB(styleType) {
+  return styleType === 'highlight' ? getHighlightRGB() : getFontRGB()
+}
+
+let highlightInterval = null
+let fontcolorInterval = null
+const lastStyleActionByType = {
+  highlight: null,
+  fontColor: null
+}
+
+const STYLE_SELECTION_PREFIX_LENGTH = 4
+const STYLE_APPLY_INTERVAL_MS = 120
+
+function readSafe(readFn, fallback = '') {
+  try {
+    const value = readFn()
+    return typeof value === 'undefined' || value === null ? fallback : value
+  } catch (e) {
+    return fallback
+  }
+}
+
+function getSelectedTextContext() {
+  const currentSelection = app.ActiveWindow.Selection
+  const currentTextRange = currentSelection.TextRange
+  if (!currentTextRange || currentTextRange.Length <= 0) {
+    return null
+  }
+
+  const shape = currentSelection.ShapeRange.Item(1)
+  const start = Number(currentTextRange.Start)
+  const length = Number(currentTextRange.Length)
+  const text = readSafe(() => currentTextRange.Text, '')
+  const targetRange = shape.TextFrame2.TextRange.Characters(start, length)
+
+  return {
+    shape,
+    targetRange,
+    state: {
+      slideId: readSafe(() => currentSelection.SlideRange.Item(1).SlideID),
+      shapeId: readSafe(() => shape.Id),
+      shapeName: readSafe(() => shape.Name),
+      start,
+      length,
+      end: start + length,
+      textPrefix: text.slice(0, STYLE_SELECTION_PREFIX_LENGTH),
+      textSuffix: text.slice(-STYLE_SELECTION_PREFIX_LENGTH)
+    }
+  }
+}
+
+function isSameEditableShape(previousState, currentState) {
+  if (
+    previousState.slideId &&
+    currentState.slideId &&
+    previousState.slideId !== currentState.slideId
+  ) {
     return false
   }
+
+  if (previousState.shapeId && currentState.shapeId) {
+    return previousState.shapeId === currentState.shapeId
+  }
+
+  return previousState.shapeName && previousState.shapeName === currentState.shapeName
+}
+
+function hasSameTextAnchor(previousState, currentState) {
+  if (!isSameEditableShape(previousState, currentState)) {
+    return false
+  }
+
+  const hasSamePrefix =
+    previousState.textPrefix &&
+    currentState.textPrefix &&
+    previousState.textPrefix === currentState.textPrefix
+  const hasSameSuffix =
+    previousState.textSuffix &&
+    currentState.textSuffix &&
+    previousState.textSuffix === currentState.textSuffix
+  const hasOverlappingRange =
+    previousState.start < currentState.end && currentState.start < previousState.end
+
+  return hasSamePrefix || hasSameSuffix || hasOverlappingRange
+}
+
+function createStyleSession(selectionState) {
+  return {
+    selectionState,
+    originalStyles: {}
+  }
+}
+
+function getCharRange(shape, index) {
+  return shape.TextFrame2.TextRange.Characters(index, 1)
+}
+
+function captureOriginalStyles(styleType, shape, selectionState, session) {
+  for (let index = selectionState.start; index < selectionState.end; index++) {
+    if (Object.prototype.hasOwnProperty.call(session.originalStyles, index)) {
+      continue
+    }
+
+    session.originalStyles[index] = getStyleRGBFromRange(styleType, getCharRange(shape, index))
+  }
+}
+
+function restoreSelectionStyles(styleType, shape, selectionState, session) {
+  for (let index = selectionState.start; index < selectionState.end; index++) {
+    if (!Object.prototype.hasOwnProperty.call(session.originalStyles, index)) {
+      continue
+    }
+
+    const color = session.originalStyles[index]
+    if (color !== HIGHLIGHT_NONE && Number.isNaN(color)) {
+      continue
+    }
+
+    setStyleRGBToRange(styleType, getCharRange(shape, index), color)
+  }
+}
+
+function clearStyleAction(styleType) {
+  lastStyleActionByType[styleType] = null
+}
+
+function prepareSelectionForStyle(styleType) {
+  const selectionContext = getSelectedTextContext()
+  if (!selectionContext) {
+    return null
+  }
+
+  const lastStyleAction = lastStyleActionByType[styleType]
+  if (
+    !lastStyleAction ||
+    !hasSameTextAnchor(lastStyleAction.selectionState, selectionContext.state)
+  ) {
+    const nextSession = createStyleSession(selectionContext.state)
+    lastStyleActionByType[styleType] = nextSession
+    return {
+      selectionContext,
+      session: nextSession
+    }
+  }
+
+  restoreSelectionStyles(
+    styleType,
+    selectionContext.shape,
+    lastStyleAction.selectionState,
+    lastStyleAction
+  )
+
+  return {
+    selectionContext,
+    session: lastStyleAction
+  }
+}
+
+function applyStyleToSelection(styleType) {
+  const preparedSelection = prepareSelectionForStyle(styleType)
+  if (!preparedSelection) {
+    return false
+  }
+
+  const { selectionContext, session } = preparedSelection
+  const { shape, targetRange, state: selectionState } = selectionContext
+
+  captureOriginalStyles(styleType, shape, selectionState, session)
 
   if (typeof app.StartNewUndoEntry === 'function') {
     app.StartNewUndoEntry()
   }
 
-  targetRange.Font.Highlight.RGB = highlightRGB
+  setStyleRGBToRange(styleType, targetRange, getTargetRGB(styleType))
+  session.selectionState = selectionState
 
   if (typeof app.StartNewUndoEntry === 'function') {
     app.StartNewUndoEntry()
@@ -170,46 +366,12 @@ function applyTextStyleToSelection() {
   return true
 }
 
+function applyTextStyleToSelection() {
+  return applyStyleToSelection('highlight')
+}
+
 function applyFontColorToSelection() {
-  const currentSelection = app.ActiveWindow.Selection
-  const currentTextRange = currentSelection.TextRange
-  if (!currentTextRange || currentTextRange.Length <= 0) {
-    return false
-  }
-
-  const shape = currentSelection.ShapeRange.Item(1)
-  const targetRange = shape.TextFrame2.TextRange.Characters(
-    currentTextRange.Start,
-    currentTextRange.Length
-  )
-
-  const fontRGB = getFontRGB()
-
-  let alreadySameFontColor = true
-  for (let i = 1; i <= currentTextRange.Length; i++) {
-    const charRange = targetRange.Characters(i, 1)
-    if (getFontRGBFromRange(charRange) !== fontRGB) {
-      alreadySameFontColor = false
-      break
-    }
-  }
-
-  if (alreadySameFontColor) {
-    console.log('already same font color, skipping;')
-    return false
-  }
-
-  if (typeof app.StartNewUndoEntry === 'function') {
-    app.StartNewUndoEntry()
-  }
-
-  setFontRGBToRange(targetRange, fontRGB)
-
-  if (typeof app.StartNewUndoEntry === 'function') {
-    app.StartNewUndoEntry()
-  }
-
-  return true
+  return applyStyleToSelection('fontColor')
 }
 
 var WebNotifycount = 0
@@ -219,12 +381,14 @@ function OnAction(control, selectedId, selectedIndex) {
 
   if (highlightColorIds.includes(selectedColorId)) {
     window.Application.PluginStorage.setItem('HighlightColor', selectedColorId)
+    clearStyleAction('highlight')
     window.Application.ribbonUI.InvalidateControl('drpHighlightColor')
     return true
   }
 
   if (fontColorIds.includes(selectedColorId)) {
     window.Application.PluginStorage.setItem('FontColor', selectedColorId)
+    clearStyleAction('fontColor')
     window.Application.ribbonUI.InvalidateControl('drpFontColor')
     return true
   }
@@ -236,10 +400,12 @@ function OnAction(control, selectedId, selectedIndex) {
       window.Application.PluginStorage.setItem('HighlightRunning', bFlag)
 
       if (bFlag) {
+        clearStyleAction('highlight')
         if (!highlightInterval) {
-          highlightInterval = setInterval(applyTextStyleToSelection, 440)
+          highlightInterval = setInterval(applyTextStyleToSelection, STYLE_APPLY_INTERVAL_MS)
         }
       } else {
+        clearStyleAction('highlight')
         if (highlightInterval) {
           clearInterval(highlightInterval)
           highlightInterval = null
@@ -258,10 +424,12 @@ function OnAction(control, selectedId, selectedIndex) {
       window.Application.PluginStorage.setItem('FontColorRunning', cFlag)
 
       if (cFlag) {
+        clearStyleAction('fontColor')
         if (!fontcolorInterval) {
-          fontcolorInterval = setInterval(applyFontColorToSelection, 440)
+          fontcolorInterval = setInterval(applyFontColorToSelection, STYLE_APPLY_INTERVAL_MS)
         }
       } else {
+        clearStyleAction('fontColor')
         if (fontcolorInterval) {
           clearInterval(fontcolorInterval)
           fontcolorInterval = null
