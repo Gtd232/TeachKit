@@ -31,6 +31,8 @@
                 </group>
                 <group id="animationGroup" label="动画助手">
                     <button id="btnSplitTextAnimation" getLabel="ribbon.OnGetLabel" onAction="ribbon.OnAction" getImage="ribbon.GetImage" size="large"/>
+                    <checkBox id="chkSplitUnderlineOriginal" label="原文字下划线" onAction="ribbon.OnAction" getPressed="ribbon.OnGetPressed"/>
+                    <checkBox id="chkSplitNewTextRed" label="新文字红色" onAction="ribbon.OnAction" getPressed="ribbon.OnGetPressed"/>
                 </group>
             </tab>
         </tabs>

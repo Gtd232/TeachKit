@@ -22,6 +22,8 @@ function OnAddinLoad(ribbonUI) {
   window.Application.PluginStorage.setItem('FontColorRunning', false)
   window.Application.PluginStorage.setItem('HighlightColor', 'colorYellow')
   window.Application.PluginStorage.setItem('FontColor', 'fontBlack')
+  window.Application.PluginStorage.setItem('SplitUnderlineOriginal', false)
+  window.Application.PluginStorage.setItem('SplitNewTextRed', false)
   return true
 }
 
@@ -48,6 +50,7 @@ const fontColorMap = {
   fontGreen: rgb(0, 176, 80),
   fontWhite: rgb(255, 255, 255)
 }
+const RED_RGB = rgb(255, 0, 0)
 
 const highlightColorIds = ['highlightNone', 'colorYellow', 'colorGreen', 'colorCyan', 'colorPink']
 
@@ -112,6 +115,17 @@ function setFontRGBToRange(textRange, color) {
   }
 
   textRange.Font.Color.RGB = color
+}
+
+function setUnderlineToRange(textRange) {
+  textRange.Font.Underline = getEnumValue('msoTrue', -1)
+}
+
+function setUnderlineToRange2(textRange, color) {
+  textRange.Font.UnderlineStyle = getEnumValue('msoUnderlineSingleLine', 2)
+  if (!Number.isNaN(color) && color >= 0) {
+    textRange.Font.UnderlineColor.RGB = color
+  }
 }
 
 function getFontRGBFromRange(textRange) {
@@ -246,6 +260,14 @@ function readSafe(readFn, fallback = '') {
   }
 }
 
+function getStorageBoolean(key) {
+  return toBoolean(window.Application.PluginStorage.getItem(key))
+}
+
+function toBoolean(value) {
+  return value === true || value === 'true' || value === -1 || value === 1
+}
+
 function getSelectedTextContext() {
   const currentSelection = app.ActiveWindow.Selection
   const sourceTextRange = readSafe(() => currentSelection.TextRange, null)
@@ -355,8 +377,6 @@ function configureExtractedTextbox(shape) {
     shape.TextFrame.MarginRight = 0
     shape.TextFrame.MarginTop = 0
     shape.TextFrame.MarginBottom = 0
-    shape.TextFrame.WordWrap = getEnumValue('msoFalse', 0)
-    shape.TextFrame.AutoSize = getEnumValue('ppAutoSizeNone', 0)
     shape.TextFrame.VerticalAnchor = getEnumValue('msoAnchorTop', 1)
   } catch (e) {
     console.log('configure extracted textbox failed;', e)
@@ -367,8 +387,6 @@ function configureExtractedTextbox(shape) {
     shape.TextFrame2.MarginRight = 0
     shape.TextFrame2.MarginTop = 0
     shape.TextFrame2.MarginBottom = 0
-    shape.TextFrame2.WordWrap = getEnumValue('msoFalse', 0)
-    shape.TextFrame2.AutoSize = getEnumValue('msoAutoSizeNone', 0)
     shape.TextFrame2.VerticalAnchor = getEnumValue('msoAnchorTop', 1)
   } catch (e) {
     console.log('configure extracted textbox2 failed;', e)
@@ -410,21 +428,10 @@ function captureRangeFormatting(textRange) {
 }
 
 function captureSelectedTextFormatting(sourceRange, textLength) {
-  const formatting = {
+  return {
     range: captureRangeFormatting(sourceRange),
-    characters: []
+    length: textLength
   }
-
-  for (let index = 1; index <= textLength; index++) {
-    try {
-      formatting.characters.push(captureRangeFormatting(sourceRange.Characters(index, 1)))
-    } catch (e) {
-      console.log('capture character formatting failed;', index, e)
-      formatting.characters.push(null)
-    }
-  }
-
-  return formatting
 }
 
 function applyRangeFormatting(formatting, targetRange) {
@@ -444,21 +451,7 @@ function applyRangeFormatting(formatting, targetRange) {
 }
 
 function copySelectedTextFormatting(selectionContext, targetRange) {
-  const formatting = selectionContext.formatting
-  applyRangeFormatting(formatting.range, targetRange)
-
-  const textLength = Math.min(
-    formatting.characters.length,
-    toFiniteNumber(readSafe(() => targetRange.Length, selectionContext.state.length), 0)
-  )
-
-  for (let index = 1; index <= textLength; index++) {
-    try {
-      applyRangeFormatting(formatting.characters[index - 1], targetRange.Characters(index, 1))
-    } catch (e) {
-      console.log('apply character formatting failed;', index, e)
-    }
-  }
+  applyRangeFormatting(selectionContext.formatting.range, targetRange)
 }
 
 function makeTextRangeTransparent(textRange) {
@@ -481,6 +474,27 @@ function makeTextRangeTransparent(textRange) {
   }
 
   return false
+}
+
+function underlineOriginalSelectedText(selectionContext) {
+  const targetRange = selectionContext.targetRange
+  const transparentRange = selectionContext.transparentRange
+  const originalColor = selectionContext.formatting.range.fontRGB
+
+  try {
+    setUnderlineToRange(targetRange)
+    if (!Number.isNaN(originalColor) && originalColor >= 0) {
+      setFontRGBToRange(targetRange, originalColor)
+    }
+  } catch (e) {
+    console.log('underline original selected text failed;', e)
+  }
+
+  try {
+    setUnderlineToRange2(transparentRange, originalColor)
+  } catch (e) {
+    console.log('underline original selected text2 failed;', e)
+  }
 }
 
 function setExtractedShapeText(shape, text) {
@@ -507,6 +521,20 @@ function fitExtractedTextboxToText(shape, bounds) {
   shape.Top = bounds.top
 }
 
+function setExtractedTextRed(shape) {
+  try {
+    setFontRGBToRange(shape.TextFrame.TextRange, RED_RGB)
+  } catch (e) {
+    console.log('set extracted text red failed;', e)
+  }
+
+  try {
+    shape.TextFrame2.TextRange.Font.Fill.ForeColor.RGB = RED_RGB
+  } catch (e) {
+    console.log('set extracted text2 red failed;', e)
+  }
+}
+
 function createExtractedTextShape(selectionContext, targetSlide) {
   const bounds = selectionContext.bounds
   const extractedShape = targetSlide.Shapes.AddTextbox(
@@ -521,18 +549,19 @@ function createExtractedTextShape(selectionContext, targetSlide) {
   extractedShape.Name = 'TeachKit_AnimatedText_' + Date.now()
   setExtractedShapeText(extractedShape, selectionContext.text)
   copySelectedTextFormatting(selectionContext, extractedShape.TextFrame.TextRange)
-  fitExtractedTextboxToText(extractedShape, bounds)
-
-  try {
-    extractedShape.ZOrder(getEnumValue('msoBringToFront', 0))
-  } catch (e) {
-    console.log('bring extracted text to front failed;', e)
+  if (getStorageBoolean('SplitNewTextRed')) {
+    setExtractedTextRed(extractedShape)
   }
+  fitExtractedTextboxToText(extractedShape, bounds)
 
   return extractedShape
 }
 
 function hideOriginalSelectedText(selectionContext) {
+  if (getStorageBoolean('SplitUnderlineOriginal')) {
+    underlineOriginalSelectedText(selectionContext)
+  }
+
   if (makeTextRangeTransparent(selectionContext.transparentRange)) {
     return true
   }
@@ -555,6 +584,15 @@ function addAppearAnimation(slide, shape) {
   const targetSlide = slide || readSafe(() => app.ActiveWindow.Selection.SlideRange.Item(1), null)
   if (!targetSlide) {
     return false
+  }
+
+  try {
+    shape.AnimationSettings.Animate = getEnumValue('msoTrue', -1)
+    shape.AnimationSettings.EntryEffect = getEnumValue('ppEffectAppear', 3844)
+    shape.AnimationSettings.AdvanceMode = getEnumValue('ppAdvanceOnClick', 1)
+    return true
+  } catch (e) {
+    console.log('set appear animation settings failed;', e)
   }
 
   try {
@@ -590,6 +628,14 @@ function addAppearAnimation(slide, shape) {
   return false
 }
 
+function setSplitUndoText() {
+  try {
+    app.ActivePresentation.SetUndoText('分离文字动画')
+  } catch (e) {
+    console.log('set split undo text failed;', e)
+  }
+}
+
 function splitSelectedTextToAnimatedTextbox() {
   const selectionContext = getSelectedTextContext()
   if (!selectionContext) {
@@ -604,10 +650,6 @@ function splitSelectedTextToAnimatedTextbox() {
   }
 
   try {
-    if (typeof app.StartNewUndoEntry === 'function') {
-      app.StartNewUndoEntry()
-    }
-
     const targetSlide =
       selectionContext.slide || readSafe(() => app.ActiveWindow.Selection.SlideRange.Item(1), null)
     if (!targetSlide) {
@@ -618,15 +660,7 @@ function splitSelectedTextToAnimatedTextbox() {
     hideOriginalSelectedText(selectionContext)
     const animationAdded = addAppearAnimation(targetSlide, extractedShape)
 
-    try {
-      extractedShape.Select()
-    } catch (e) {
-      console.log('select extracted textbox failed;', e)
-    }
-
-    if (typeof app.StartNewUndoEntry === 'function') {
-      app.StartNewUndoEntry()
-    }
+    setSplitUndoText()
 
     if (!animationAdded) {
       showMessage('文字已经分离为文本框，但添加动画失败。请检查当前 WPS 版本是否支持 TimeLine 动画 API。')
@@ -781,8 +815,35 @@ function applyFontColorToSelection() {
 }
 
 var WebNotifycount = 0
-function OnAction(control, selectedId, selectedIndex) {
-  const eleId = getRibbonId(control)
+function normalizeRibbonActionArgs(arg1, arg2, arg3) {
+  if (getRibbonId(arg1)) {
+    return {
+      control: arg1,
+      selectedId: arg2,
+      selectedIndex: arg3
+    }
+  }
+
+  if (getRibbonId(arg2)) {
+    return {
+      control: arg2,
+      selectedId: arg1,
+      selectedIndex: arg3
+    }
+  }
+
+  return {
+    control: arg1,
+    selectedId: arg2,
+    selectedIndex: arg3
+  }
+}
+
+function OnAction(controlArg, selectedIdArg, selectedIndexArg) {
+  const actionArgs = normalizeRibbonActionArgs(controlArg, selectedIdArg, selectedIndexArg)
+  const eleId = getRibbonId(actionArgs.control)
+  const selectedId = actionArgs.selectedId
+  const selectedIndex = actionArgs.selectedIndex
   const selectedColorId = getSelectedColorId(eleId, selectedId, selectedIndex)
 
   if (highlightColorIds.includes(selectedColorId)) {
@@ -846,6 +907,14 @@ function OnAction(control, selectedId, selectedIndex) {
     }
     case 'btnSplitTextAnimation':
       splitSelectedTextToAnimatedTextbox()
+      break
+    case 'chkSplitUnderlineOriginal':
+      window.Application.PluginStorage.setItem('SplitUnderlineOriginal', toBoolean(selectedId))
+      window.Application.ribbonUI.InvalidateControl('chkSplitUnderlineOriginal')
+      break
+    case 'chkSplitNewTextRed':
+      window.Application.PluginStorage.setItem('SplitNewTextRed', toBoolean(selectedId))
+      window.Application.ribbonUI.InvalidateControl('chkSplitNewTextRed')
       break
     // case 'drpFontColor': {
     //   window.Application.PluginStorage.setItem('FontColor', selectedId)
@@ -1001,6 +1070,19 @@ function OnGetLabel(control) {
   return ''
 }
 
+function OnGetPressed(control) {
+  const eleId = getRibbonId(control)
+
+  switch (eleId) {
+    case 'chkSplitUnderlineOriginal':
+      return getStorageBoolean('SplitUnderlineOriginal')
+    case 'chkSplitNewTextRed':
+      return getStorageBoolean('SplitNewTextRed')
+  }
+
+  return false
+}
+
 function OnGetSelectedItemID(control) {
   const eleId = getRibbonId(control)
 
@@ -1031,6 +1113,7 @@ export default {
   OnGetEnabled,
   OnGetVisible,
   OnGetLabel,
+  OnGetPressed,
   OnGetSelectedItemID,
   OnNewDocumentApiEvent
 }
