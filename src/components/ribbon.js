@@ -195,6 +195,47 @@ const lastStyleActionByType = {
 
 const STYLE_SELECTION_PREFIX_LENGTH = 4
 const STYLE_APPLY_INTERVAL_MS = 120
+const EXTRACTED_TEXT_MIN_WIDTH = 8
+const EXTRACTED_TEXT_MIN_HEIGHT = 8
+const FONT_FORMAT_PROPERTIES = [
+  'Bold',
+  'Italic',
+  'BaselineOffset',
+  'Size',
+  'Subscript',
+  'Superscript',
+  'Shadow',
+  'Emboss',
+  'Underline',
+  'Name',
+  'NameAscii',
+  'NameComplexScript',
+  'NameFarEast',
+  'AutoRotateNumbers',
+  'NameOther'
+]
+
+function getEnumValue(name, fallback) {
+  if (typeof window[name] !== 'undefined') {
+    return window[name]
+  }
+
+  const enumObject = window.Application && window.Application.Enum
+  if (enumObject && typeof enumObject[name] !== 'undefined') {
+    return enumObject[name]
+  }
+
+  return fallback
+}
+
+function showMessage(message) {
+  if (typeof alert === 'function') {
+    alert(message)
+    return
+  }
+
+  console.log(message)
+}
 
 function readSafe(readFn, fallback = '') {
   try {
@@ -207,20 +248,32 @@ function readSafe(readFn, fallback = '') {
 
 function getSelectedTextContext() {
   const currentSelection = app.ActiveWindow.Selection
-  const currentTextRange = currentSelection.TextRange
-  if (!currentTextRange || currentTextRange.Length <= 0) {
+  const sourceTextRange = readSafe(() => currentSelection.TextRange, null)
+  const selectedText = readSafe(() => sourceTextRange.Text, '')
+  const selectedLength = toFiniteNumber(readSafe(() => sourceTextRange.Length, 0), 0)
+
+  if (!selectedText || selectedLength <= 0) {
     return null
   }
 
   const shape = currentSelection.ShapeRange.Item(1)
-  const start = Number(currentTextRange.Start)
-  const length = Number(currentTextRange.Length)
-  const text = readSafe(() => currentTextRange.Text, '')
-  const targetRange = shape.TextFrame2.TextRange.Characters(start, length)
+  const start = toFiniteNumber(readSafe(() => sourceTextRange.Start, 1), 1)
+  const length = selectedLength
+  const slide = readSafe(() => currentSelection.SlideRange.Item(1), null)
+  const transparentRange = readSafe(
+    () => shape.TextFrame2.TextRange.Characters(Math.max(start, 1), length),
+    null
+  )
 
   return {
+    slide,
     shape,
-    targetRange,
+    targetRange: sourceTextRange,
+    transparentRange,
+    sourceTextRange,
+    text: selectedText,
+    bounds: getTextRangeBounds(sourceTextRange),
+    formatting: captureSelectedTextFormatting(sourceTextRange, selectedLength),
     state: {
       slideId: readSafe(() => currentSelection.SlideRange.Item(1).SlideID),
       shapeId: readSafe(() => shape.Id),
@@ -228,9 +281,362 @@ function getSelectedTextContext() {
       start,
       length,
       end: start + length,
-      textPrefix: text.slice(0, STYLE_SELECTION_PREFIX_LENGTH),
-      textSuffix: text.slice(-STYLE_SELECTION_PREFIX_LENGTH)
+      textPrefix: selectedText.slice(0, STYLE_SELECTION_PREFIX_LENGTH),
+      textSuffix: selectedText.slice(-STYLE_SELECTION_PREFIX_LENGTH)
     }
+  }
+}
+
+function toFiniteNumber(value, fallback = 0) {
+  const numberValue = Number(value)
+  return Number.isFinite(numberValue) ? numberValue : fallback
+}
+
+function getTextRangeBounds(textRange) {
+  if (!textRange) {
+    throw new Error('无法读取选中文字边界')
+  }
+
+  const boundLeft = toFiniteNumber(
+    readSafe(() => textRange.BoundLeft, NaN),
+    NaN
+  )
+  const boundTop = toFiniteNumber(
+    readSafe(() => textRange.BoundTop, NaN),
+    NaN
+  )
+  const boundWidth = toFiniteNumber(
+    readSafe(() => textRange.BoundWidth, NaN),
+    NaN
+  )
+  const boundHeight = toFiniteNumber(
+    readSafe(() => textRange.BoundHeight, NaN),
+    NaN
+  )
+
+  if (
+    Number.isFinite(boundLeft) &&
+    Number.isFinite(boundTop) &&
+    boundWidth > 0 &&
+    boundHeight > 0
+  ) {
+    return {
+      left: boundLeft,
+      top: boundTop,
+      width: boundWidth,
+      height: boundHeight
+    }
+  }
+
+  throw new Error('无法读取选中文字边界')
+}
+
+function setShapeChromeInvisible(shape) {
+  const msoFalse = getEnumValue('msoFalse', 0)
+
+  try {
+    shape.Fill.Visible = msoFalse
+  } catch (e) {
+    console.log('hide textbox fill failed;', e)
+  }
+
+  try {
+    shape.Line.Visible = msoFalse
+  } catch (e) {
+    console.log('hide textbox line failed;', e)
+  }
+}
+
+function configureExtractedTextbox(shape) {
+  setShapeChromeInvisible(shape)
+
+  try {
+    shape.TextFrame.MarginLeft = 0
+    shape.TextFrame.MarginRight = 0
+    shape.TextFrame.MarginTop = 0
+    shape.TextFrame.MarginBottom = 0
+    shape.TextFrame.WordWrap = getEnumValue('msoFalse', 0)
+    shape.TextFrame.AutoSize = getEnumValue('ppAutoSizeNone', 0)
+    shape.TextFrame.VerticalAnchor = getEnumValue('msoAnchorTop', 1)
+  } catch (e) {
+    console.log('configure extracted textbox failed;', e)
+  }
+
+  try {
+    shape.TextFrame2.MarginLeft = 0
+    shape.TextFrame2.MarginRight = 0
+    shape.TextFrame2.MarginTop = 0
+    shape.TextFrame2.MarginBottom = 0
+    shape.TextFrame2.WordWrap = getEnumValue('msoFalse', 0)
+    shape.TextFrame2.AutoSize = getEnumValue('msoAutoSizeNone', 0)
+    shape.TextFrame2.VerticalAnchor = getEnumValue('msoAnchorTop', 1)
+  } catch (e) {
+    console.log('configure extracted textbox2 failed;', e)
+  }
+}
+
+function captureObjectProperties(source, properties) {
+  const snapshot = {}
+
+  for (const property of properties) {
+    try {
+      const value = source[property]
+      if (typeof value !== 'undefined' && value !== null) {
+        snapshot[property] = value
+      }
+    } catch (e) {
+      console.log('capture object property failed;', property, e)
+    }
+  }
+
+  return snapshot
+}
+
+function applyObjectProperties(snapshot, target) {
+  for (const property of Object.keys(snapshot)) {
+    try {
+      target[property] = snapshot[property]
+    } catch (e) {
+      console.log('apply object property failed;', property, e)
+    }
+  }
+}
+
+function captureRangeFormatting(textRange) {
+  return {
+    fontProperties: captureObjectProperties(textRange.Font, FONT_FORMAT_PROPERTIES),
+    fontRGB: getFontRGBFromRange(textRange)
+  }
+}
+
+function captureSelectedTextFormatting(sourceRange, textLength) {
+  const formatting = {
+    range: captureRangeFormatting(sourceRange),
+    characters: []
+  }
+
+  for (let index = 1; index <= textLength; index++) {
+    try {
+      formatting.characters.push(captureRangeFormatting(sourceRange.Characters(index, 1)))
+    } catch (e) {
+      console.log('capture character formatting failed;', index, e)
+      formatting.characters.push(null)
+    }
+  }
+
+  return formatting
+}
+
+function applyRangeFormatting(formatting, targetRange) {
+  if (!formatting) {
+    return
+  }
+
+  try {
+    applyObjectProperties(formatting.fontProperties, targetRange.Font)
+  } catch (e) {
+    console.log('apply font formatting failed;', e)
+  }
+
+  if (!Number.isNaN(formatting.fontRGB) && formatting.fontRGB >= 0) {
+    setFontRGBToRange(targetRange, formatting.fontRGB)
+  }
+}
+
+function copySelectedTextFormatting(selectionContext, targetRange) {
+  const formatting = selectionContext.formatting
+  applyRangeFormatting(formatting.range, targetRange)
+
+  const textLength = Math.min(
+    formatting.characters.length,
+    toFiniteNumber(readSafe(() => targetRange.Length, selectionContext.state.length), 0)
+  )
+
+  for (let index = 1; index <= textLength; index++) {
+    try {
+      applyRangeFormatting(formatting.characters[index - 1], targetRange.Characters(index, 1))
+    } catch (e) {
+      console.log('apply character formatting failed;', index, e)
+    }
+  }
+}
+
+function makeTextRangeTransparent(textRange) {
+  if (!textRange) {
+    return false
+  }
+
+  try {
+    textRange.Font.Fill.Solid()
+  } catch (e) {
+    console.log('set original text fill solid failed;', e)
+  }
+
+  try {
+    textRange.Font.Fill.Visible = getEnumValue('msoTrue', -1)
+    textRange.Font.Fill.Transparency = 1
+    return true
+  } catch (e) {
+    console.log('make original text transparent failed;', e)
+  }
+
+  return false
+}
+
+function setExtractedShapeText(shape, text) {
+  try {
+    shape.TextFrame2.TextRange.Text = text
+    return
+  } catch (e) {
+    console.log('set text through textframe2 failed;', e)
+  }
+
+  try {
+    shape.TextFrame.TextRange.Text = text
+  } catch (e) {
+    console.log('set text through textframe failed;', e)
+  }
+}
+
+function fitExtractedTextboxToText(shape, bounds) {
+  shape.TextFrame.WordWrap = getEnumValue('msoFalse', 0)
+  shape.TextFrame.AutoSize = getEnumValue('ppAutoSizeShapeToFitText', 1)
+  shape.TextFrame2.WordWrap = getEnumValue('msoFalse', 0)
+  shape.TextFrame2.AutoSize = getEnumValue('msoAutoSizeShapeToFitText', 1)
+  shape.Left = bounds.left
+  shape.Top = bounds.top
+}
+
+function createExtractedTextShape(selectionContext, targetSlide) {
+  const bounds = selectionContext.bounds
+  const extractedShape = targetSlide.Shapes.AddTextbox(
+    getEnumValue('msoTextOrientationHorizontal', 1),
+    bounds.left,
+    bounds.top,
+    Math.max(bounds.width, EXTRACTED_TEXT_MIN_WIDTH),
+    Math.max(bounds.height, EXTRACTED_TEXT_MIN_HEIGHT)
+  )
+
+  configureExtractedTextbox(extractedShape)
+  extractedShape.Name = 'TeachKit_AnimatedText_' + Date.now()
+  setExtractedShapeText(extractedShape, selectionContext.text)
+  copySelectedTextFormatting(selectionContext, extractedShape.TextFrame.TextRange)
+  fitExtractedTextboxToText(extractedShape, bounds)
+
+  try {
+    extractedShape.ZOrder(getEnumValue('msoBringToFront', 0))
+  } catch (e) {
+    console.log('bring extracted text to front failed;', e)
+  }
+
+  return extractedShape
+}
+
+function hideOriginalSelectedText(selectionContext) {
+  if (makeTextRangeTransparent(selectionContext.transparentRange)) {
+    return true
+  }
+
+  if (makeTextRangeTransparent(selectionContext.targetRange)) {
+    return true
+  }
+
+  try {
+    selectionContext.targetRange.Font.Fill.Visible = getEnumValue('msoFalse', 0)
+    return true
+  } catch (e) {
+    console.log('hide original text visibility failed;', e)
+  }
+
+  return false
+}
+
+function addAppearAnimation(slide, shape) {
+  const targetSlide = slide || readSafe(() => app.ActiveWindow.Selection.SlideRange.Item(1), null)
+  if (!targetSlide) {
+    return false
+  }
+
+  try {
+    const sequence = targetSlide.TimeLine.MainSequence
+    const effect = sequence.AddEffect(
+      shape,
+      getEnumValue('msoAnimEffectAppear', 1),
+      getEnumValue('msoAnimateLevelNone', 0),
+      getEnumValue('msoAnimTriggerOnPageClick', 1)
+    )
+    try {
+      effect.Timing.TriggerType = getEnumValue('msoAnimTriggerOnPageClick', 1)
+    } catch (e) {
+      console.log('set animation trigger failed;', e)
+    }
+    return true
+  } catch (e) {
+    console.log('add appear animation failed;', e)
+  }
+
+  try {
+    const sequence = targetSlide.TimeLine.MainSequence
+    sequence.AddEffect(
+      shape,
+      getEnumValue('msoAnimEffectAppear', 1),
+      getEnumValue('msoAnimTriggerOnPageClick', 1)
+    )
+    return true
+  } catch (e) {
+    console.log('add appear animation fallback failed;', e)
+  }
+
+  return false
+}
+
+function splitSelectedTextToAnimatedTextbox() {
+  const selectionContext = getSelectedTextContext()
+  if (!selectionContext) {
+    showMessage('请先在文本框中选中要分离并添加动画的文字')
+    return false
+  }
+
+  const selectedText = selectionContext.text
+  if (!selectedText) {
+    showMessage('当前选区没有文字')
+    return false
+  }
+
+  try {
+    if (typeof app.StartNewUndoEntry === 'function') {
+      app.StartNewUndoEntry()
+    }
+
+    const targetSlide =
+      selectionContext.slide || readSafe(() => app.ActiveWindow.Selection.SlideRange.Item(1), null)
+    if (!targetSlide) {
+      throw new Error('没有找到当前幻灯片')
+    }
+
+    const extractedShape = createExtractedTextShape(selectionContext, targetSlide)
+    hideOriginalSelectedText(selectionContext)
+    const animationAdded = addAppearAnimation(targetSlide, extractedShape)
+
+    try {
+      extractedShape.Select()
+    } catch (e) {
+      console.log('select extracted textbox failed;', e)
+    }
+
+    if (typeof app.StartNewUndoEntry === 'function') {
+      app.StartNewUndoEntry()
+    }
+
+    if (!animationAdded) {
+      showMessage('文字已经分离为文本框，但添加动画失败。请检查当前 WPS 版本是否支持 TimeLine 动画 API。')
+    }
+
+    return true
+  } catch (e) {
+    console.log('split selected text failed;', e)
+    showMessage('分离选中文字失败：' + (e && e.message ? e.message : e))
+    return false
   }
 }
 
@@ -438,6 +844,9 @@ function OnAction(control, selectedId, selectedIndex) {
       window.Application.ribbonUI.InvalidateControl('btnToggleFontColor')
       break
     }
+    case 'btnSplitTextAnimation':
+      splitSelectedTextToAnimatedTextbox()
+      break
     // case 'drpFontColor': {
     //   window.Application.PluginStorage.setItem('FontColor', selectedId)
     //   break
@@ -578,6 +987,8 @@ function OnGetLabel(control) {
       let cFlag = window.Application.PluginStorage.getItem('FontColorRunning')
       return cFlag ? '停止应用字色' : '开始应用字色'
     }
+    case 'btnSplitTextAnimation':
+      return '分离文字动画'
     case 'btnIsEnbable': {
       let bFlag = window.Application.PluginStorage.getItem('EnableFlag')
       return bFlag ? '按钮Disable' : '按钮Enable'

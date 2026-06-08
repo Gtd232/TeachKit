@@ -29,6 +29,9 @@
                         <item id="fontWhite" label="白色" />
                     </dropDown>
                 </group>
+                <group id="animationGroup" label="动画助手">
+                    <button id="btnSplitTextAnimation" getLabel="ribbon.OnGetLabel" onAction="ribbon.OnAction" getImage="ribbon.GetImage" size="large"/>
+                </group>
             </tab>
         </tabs>
     </ribbon>
